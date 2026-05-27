@@ -2,8 +2,10 @@ package com.sharedhealth;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
@@ -50,6 +52,7 @@ public final class SharedHealthPlugin extends JavaPlugin implements Listener {
     private static final String DATA_SHARED_ABSORPTION = "shared-absorption";
     private static final String DATA_SHARED_DEATH_COUNTER = "shared-death-counter";
     private static final String DATA_PLAYER_DEATH_SYNC = "player-death-sync";
+    private static final String DATA_PLAYER_DEATHS = "player-deaths";
     private static final double EPSILON = 1.0E-6D;
 
     private File dataFile;
@@ -75,6 +78,8 @@ public final class SharedHealthPlugin extends JavaPlugin implements Listener {
     private boolean dataDirty;
     private long sharedDeathCounter;
     private final Map<UUID, Long> playerDeathSync = new HashMap<>();
+    private final Map<UUID, Integer> playerDeaths = new HashMap<>();
+    private final Map<UUID, Double> playerDamageTaken = new HashMap<>();
 
     @Override
     public void onEnable() {
@@ -111,6 +116,11 @@ public final class SharedHealthPlugin extends JavaPlugin implements Listener {
         }
 
         Player source = (Player) entity;
+        if (finalDamage > 0.0D) {
+            playerDamageTaken.merge(source.getUniqueId(), finalDamage, Double::sum);
+            updateTabListEntry(source);
+        }
+
         double sourceHealthBeforeDamage = source.getHealth();
         double sourceAbsorptionBeforeDamage = source.getAbsorptionAmount();
         Bukkit.getScheduler().runTask(
@@ -260,6 +270,10 @@ public final class SharedHealthPlugin extends JavaPlugin implements Listener {
         }
 
         broadcastSharedKilledChat(event.getPlayer().getName());
+        incrementPlayerDeaths();
+        broadcastDeathStats();
+        playerDamageTaken.clear();
+        updateAllTabListEntries();
         wipeAllOnlineInventories();
         wipeAllOnlineEnderChests();
         event.getDrops().clear();
@@ -279,6 +293,7 @@ public final class SharedHealthPlugin extends JavaPlugin implements Listener {
         event.joinMessage(null);
         broadcastJoinChat(event.getPlayer().getName());
         syncJoiningPlayerToSharedState(event.getPlayer());
+        updateAllTabListEntries();
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
@@ -287,6 +302,7 @@ public final class SharedHealthPlugin extends JavaPlugin implements Listener {
         Bukkit.getScheduler().runTask(this, () -> {
             syncPlayerToSharedState(respawned);
             markPlayerDeathSynced(respawned.getUniqueId(), sharedDeathCounter);
+            updateAllTabListEntries();
         });
     }
 
@@ -655,6 +671,56 @@ public final class SharedHealthPlugin extends JavaPlugin implements Listener {
         dataDirty = true;
         for (Player online : Bukkit.getOnlinePlayers()) {
             markPlayerDeathSynced(online.getUniqueId(), sharedDeathCounter);
+        }
+    }
+
+    private void updateAllTabListEntries() {
+        for (Player online : Bukkit.getOnlinePlayers()) {
+            updateTabListEntry(online);
+        }
+    }
+
+    private void updateTabListEntry(Player player) {
+        UUID id = player.getUniqueId();
+        double damage = playerDamageTaken.getOrDefault(id, 0.0);
+        int deaths = playerDeaths.getOrDefault(id, 0);
+        Component entry = Component.empty()
+                .append(Component.text(player.getName(), NamedTextColor.WHITE))
+                .append(Component.text("  ", NamedTextColor.GRAY))
+                .append(Component.text(formatHeartsAmount(damage) + " ❤", NamedTextColor.RED))
+                .append(Component.text("  ☠ " + deaths, NamedTextColor.GRAY));
+        player.playerListName(entry);
+    }
+
+    private void incrementPlayerDeaths() {
+        for (Player online : Bukkit.getOnlinePlayers()) {
+            playerDeaths.merge(online.getUniqueId(), 1, Integer::sum);
+        }
+        dataDirty = true;
+    }
+
+    private void broadcastDeathStats() {
+        List<Player> sorted = new ArrayList<>(Bukkit.getOnlinePlayers());
+        if (sorted.isEmpty()) {
+            return;
+        }
+
+        sorted.sort((a, b) -> Double.compare(
+                playerDamageTaken.getOrDefault(b.getUniqueId(), 0.0),
+                playerDamageTaken.getOrDefault(a.getUniqueId(), 0.0)));
+
+        Bukkit.broadcast(Component.text("═══ Statistiques ═══", NamedTextColor.GOLD));
+        for (Player p : sorted) {
+            UUID id = p.getUniqueId();
+            double damage = playerDamageTaken.getOrDefault(id, 0.0);
+            int deaths = playerDeaths.getOrDefault(id, 0);
+            Component line = Component.empty()
+                    .append(Component.text(p.getName(), NamedTextColor.YELLOW))
+                    .append(Component.text(" — ", NamedTextColor.GRAY))
+                    .append(Component.text(formatHeartsAmount(damage) + " ❤ dégâts", NamedTextColor.RED))
+                    .append(Component.text(" | ", NamedTextColor.GRAY))
+                    .append(Component.text(deaths + " mort" + (deaths != 1 ? "s" : ""), NamedTextColor.WHITE));
+            Bukkit.broadcast(line);
         }
     }
 
@@ -1108,6 +1174,7 @@ public final class SharedHealthPlugin extends JavaPlugin implements Listener {
             sharedAbsorptionInitialized = false;
             sharedDeathCounter = 0L;
             playerDeathSync.clear();
+            playerDeaths.clear();
             dataDirty = false;
             return;
         }
@@ -1133,6 +1200,20 @@ public final class SharedHealthPlugin extends JavaPlugin implements Listener {
                     playerDeathSync.put(playerId, syncedCounter);
                 } catch (IllegalArgumentException exception) {
                     getLogger().warning("Ignoring invalid player uuid in death sync data: " + key);
+                }
+            }
+        }
+
+        playerDeaths.clear();
+        ConfigurationSection playerDeathsSection = dataConfig.getConfigurationSection(DATA_PLAYER_DEATHS);
+        if (playerDeathsSection != null) {
+            for (String key : playerDeathsSection.getKeys(false)) {
+                try {
+                    UUID playerId = UUID.fromString(key);
+                    int deaths = Math.max(0, playerDeathsSection.getInt(key, 0));
+                    playerDeaths.put(playerId, deaths);
+                } catch (IllegalArgumentException exception) {
+                    getLogger().warning("Ignoring invalid player uuid in player deaths data: " + key);
                 }
             }
         }
@@ -1165,6 +1246,11 @@ public final class SharedHealthPlugin extends JavaPlugin implements Listener {
         dataConfig.set(DATA_PLAYER_DEATH_SYNC, null);
         for (Map.Entry<UUID, Long> entry : playerDeathSync.entrySet()) {
             dataConfig.set(DATA_PLAYER_DEATH_SYNC + "." + entry.getKey(), Math.max(0L, entry.getValue()));
+        }
+
+        dataConfig.set(DATA_PLAYER_DEATHS, null);
+        for (Map.Entry<UUID, Integer> entry : playerDeaths.entrySet()) {
+            dataConfig.set(DATA_PLAYER_DEATHS + "." + entry.getKey(), Math.max(0, entry.getValue()));
         }
 
         try {
